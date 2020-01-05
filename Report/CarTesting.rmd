@@ -1,0 +1,708 @@
+---
+title: "HarvardX Data Science Capstone - CYO Project - Car testing"
+author: "Manuel Diaz"
+date: "December 19th, 2019"
+output: pdf_document
+---
+
+```{r setup, include = FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+if(!require(ggrepel)) install.packages("ggrepel", repos = "http://cran.us.r-project.org")
+if(!require(gridExtra)) install.packages("gridExtra", repos = "http://cran.us.r-project.org")
+if(!require(stringr)) install.packages("stringr", repos = "http://cran.us.r-project.org")
+if(!require(fastICA)) install.packages("fastICA", repos = "http://cran.us.r-project.org")
+if(!require(kknn)) install.packages("kknn", repos = "http://cran.us.r-project.org")
+
+options(digits = 5)
+
+```
+
+```{r load_data, include = FALSE}
+
+# load data
+dl <- tempfile()
+download.file("https://raw.githubusercontent.com/manueldiaz50/CarTesting/master/Data/train.csv", dl)
+data <- read.csv(dl, header = TRUE)
+
+# convert categorical variables to binary
+data_bin <- data %>% select(ID, y, X0, X1, X2, X3, X4, X5, X6, X8) %>% 
+  gather(key = "feature", value = "value", -y, -ID) %>% 
+  mutate(present = 1, value = paste(feature, value, sep ="_") ) %>%
+  select(-feature) %>%
+  spread(value, present, fill = 0)
+data_bin <- data %>% select(-y, -X0, -X1, -X2, -X3, -X4, -X5, -X6, -X8) %>%
+  left_join(data_bin, by = "ID") 
+
+# leave only the ground truth and the features. Remove ID field that will not be used in the model
+data_bin <- data_bin %>% select(-ID)
+
+# create carTesting and validation datasets
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = data_bin$y, times = 1, p = 0.1, list = FALSE)
+carTesting <- data_bin[-test_index,]
+validation <- data_bin[test_index,]
+
+rm(test_index, dl)
+
+```
+
+## I. Introduction {#introduction}
+
+This document describes my work on the projet of building a system to predict the time that a car manufacturer will spend in the quality control bench. The dataset contains an anonymized set of variables describing custom features of a Mercedes car and the time spent in testing them. It is available to the public in [www.kaggle.com](https://www.kaggle.com/arsenland/mercedesbenz-greener-manufacturing).
+
+The final R code used to build the model and the prediction is provided in a separated file and it also available to the public in the GitHub repository [manueldiaz50/CarTesting.git](https://github.com/manueldiaz50/carTesting2.git).
+
+\pagebreak
+
+## II. Method and Analysis {#analysis}
+
+### 2.1 The Dataset {#a2_1}
+
+The dataset contains 4,209 observations each one corresponding to the time spent in the test of a car with different features. Present in the dataset are a unique identifier of the test, categorical and numeric fields indicating the car characteristics, and the time spent in the test.
+
+|Fields in the dataset|
+|:-------------------:|
+
+|Field|Definition|
+|:----|:---------|
+|ID|Unique identifier of the row|
+|y|time spent in the test|
+|X0 to X8|9 fields with categorical values|
+|X10 to X377|368 numerical fields with values 0 or 1|
+
+Below a few records as an example:
+
+```{r, echo = FALSE, results = 'asis', warning = FALSE}
+  c <- data %>% select(-ID, -y) %>% sapply(class)
+  t <- data %>% gather(key = "feature", value = "value", -y, -ID)
+  
+  factors <- names(c[c == "factor"])
+  numerical <- names(c[c != "factor"])
+
+  data %>% select(ID, y, factors, X10, X11, X12, X377) %>% head() %>% 
+  knitr::kable(row.names = FALSE)
+
+```
+
+To start, we split the dataset into two separated sets, _carTesting_ and _validation_, with 90% and 10% of the data respectively sampled randomly from the original dataset. We will use _carTesting_ to build and train the model and _validation_ to measure the final performance.
+
+\pagebreak
+
+### 2.2 Exploratory analysis {#a2_2}
+
+We start examining the outcome variable Y:
+
+```{r, echo = FALSE}
+  data %>% ggplot(aes(y)) + geom_histogram(bins = 50)
+
+```
+
+We can see 3 different modes in the values distribution which suggests the presence of clusters in the data. Most observations have Y values between 72 and 175 except for one observation that lays on 265.32.
+
+|y statistics|value|
+|:-----------|----:|
+|Min|72.11|
+|1st Qu.|90.82|  
+|Median|99.15|  
+|Mean|100.67|  
+|3rd Qu.|109.01|  
+|Max.|265.32|
+|Sd.|12.68|
+
+\pagebreak
+
+Next we inspect the categorical features. The charts below show their distribution. 
+
+```{r, echo = FALSE}
+  t %>% filter(feature %in% factors) %>%
+    ggplot(aes(value, y, color = value)) +
+    geom_boxplot() + 
+    facet_wrap( ~ feature, scales = "free", nrow = 4, ncol = 2) +
+    theme(legend.position = "none")
+
+  t %>% filter(feature %in% factors) %>%
+    ggplot(aes(value, fill = feature)) +
+    geom_bar(stat = "count") + 
+    facet_wrap( ~ feature, scales = "free", nrow = 4, ncol = 2) +
+    theme(legend.position = "none")
+
+```
+
+Most observations have the value d in the variable X4 so this feature will not be informative.
+
+Finally, the next chart shows the value counts of the binary features.
+
+```{r r2_1_3, echo = FALSE, warning = FALSE}
+  t %>% filter(feature %in% numerical) %>%
+    ggplot(aes(feature, fill = value)) + 
+    geom_bar(stat = "count", position = "stack") + 
+    coord_flip() +
+    theme_void()
+ 
+```
+
+We can see high variability in many of them while a few are almost always zero or one.
+
+### 2.3 General model {#a2_3}
+
+After the analysis we are now ready to formulate a model for the prediction where the time spent in the test of a car *i* can be calculated as the total average testing time plus a variability effect for each of the features present in the car.
+
+|$y_{i} = \mu + \sum_{}E_{j} + \epsilon_{i}$|
+|:-----------------------------------------:|
+
+Where $\mu$ is the average testing rate, $E_{j}$ is the varability for the feature *j* and $\epsilon_{i}$ is an independent random error.
+
+We call $\mu$ and $E_{j}$ the baseline predictors, so the time estimate for the car *i* will be computed as:
+
+|$\hat{y}_{i} = \hat{\mu} + \sum_{}\hat{E}_{j}$|
+|:--------------------------------------------:|
+
+Where $\hat{\mu}$ and $\hat{E}_{j}$ are estimates of the baseline predictors.
+
+We can easily compute the estimates of the binary features as:
+
+|$\hat{E}_{b} = \hat{e}_{b}X_{b}$|
+|:------------------------------:|
+
+Where $\hat{e}_{b}$ is the avearage time variability of testing the feature *b* and $X_{b}$ is 1 when the feature is present in the car and 0 otherwise.
+
+We can extend this model to the categorical variables too and compute the predictor estimate for a feature *c* as:
+
+|$\hat{E}_{c} = \sum_{1}^{n}\hat{e}(v)X_{cv}$|
+|:------------------------------------------:|
+
+Where *n* is the number of different values of the feature *c*, $\hat{e}(v)$ is the average time variability of testing the feature *c* when the value is *v*, and $X_{cv}$ is 1 when the value of $X_{c}$ is *v* and zero otherwise.
+
+In practice, this is equivalent to convert each categorical feature $X_{c}$ into *n* binary features $X_{cv}$ so our final model is left only with binary features.
+
+The table below shows the example of converting the categorical feature $X1$:
+
+| ID|      y|X1 |*|X1_v|X1_t|X1_w|X1_b|
+|--:|------:|:--|-|---:|---:|---:|---:|
+|  0| 130.81|v  |*|1|0|0|0|
+|  6|  88.53|t  |*|0|1|0|0|
+|  7|  76.26|w  |*|0|0|1|0|
+|  9|  80.62|t  |*|0|1|0|0|
+| 13|  78.02|v  |*|1|0|0|0|
+| 18|  92.93|b  |*|0|0|0|1|
+
+We will add this pre-processing step in our dataset and work only with binary features in the following sections.
+
+\pagebreak
+ 
+### 2.4 Loss function {#a2_4}
+
+The loss function measures the perfomance of the prediction in a given test dataset. Here we want to establish how far our prediction $\hat{y}_{i}$ is from the true time $y_{i}$. For this, we will use the *least squares estimates* as the sum of the squares of the differences between the predicted and the true times and our best prediction will be the winner of the minimum residual mean squared error (RMSE) defined as:
+
+|$RMSE = \sqrt{\frac{1}{N}\sum_{i=1}^{N}({y}_{i} - \hat{y}_{i})^2}$|
+|:----------------------------------------------------------------:|
+
+Where $\hat{y}_{i}$ is our prediction for the testing time of the car *i*, $y_{i}$ is the true time in the test dataset for the same car and N is the total number of observations in the test dataset.
+
+```{r r2_2_4, echo = FALSE, include = FALSE}
+
+  RMSE <- function(true_ratings, predicted_ratings){
+    sqrt(mean((true_ratings - predicted_ratings)^2))
+  }
+
+```
+
+\pagebreak
+
+### 2.5 The challenge of dimensionality {#a2_5}
+
+After converting the categorical features our _train_ dataset has now 563 variables for only 3,786 observations. The number of variables is already a handicap for some good learning algorithms like KNN or Random Forests but most important is the fact that can make our model overtrained.
+
+Overtraining will occur when the model learns the train data including their noise component and produces low errors in the train data but does not perform well in any other dataset.
+
+Our concern is whether we have the number of observations enough for our model to generalise sufficiently well. The algorithm will try to separate data into classes based on the features present in the train dataset, so when the number of them increases we need more observations to be sure that our sample data represents well the reality.
+
+As we cannot increase the number of observations in this case, we will focus on selecting only the features that make our model the most general possible. In order to know if our model is generalising well at each step, we split the _carTesting_ dataset in two separated _train_ and _test_ datasets with the 70% and 30% of the data respectively randomly sampled from _carTesting_.
+
+In the following sections we will explore a few methods of dimension reduction, train different algorithms in the _train_ dataset with the reduced dimension spaces, and produce predictions in the _test_ dataset to measure their performance. We will call _expected RMSE_ the peformance of the predictions in the _train_ dataset to separate it from the performance obtained in the _test_ dataset.
+
+```{r, echo = FALSE, warning = FALSE}
+  # create train and test datasets
+  set.seed(1, sample.kind="Rounding")
+  test_index <- createDataPartition(y = data_bin$y, times = 1, p = 0.3, list = FALSE)
+  train <- data_bin[-test_index,]
+  test <- data_bin[test_index,]
+
+  rm(test_index)
+  
+```
+
+### 2.6 Naive Bayes {#a2_6}
+
+In this first model, we assume the same time for all cars independently of the features to test with the differences explained by a random variation: 
+
+|$y_{i} = \mu + \epsilon_{i}$|
+|:--------------------------:|
+
+Where $\mu$ the true testing time and  $\epsilon_{i}$ are independent errors sampled from the same distribution and centered at zero. Our prediction for a car *i* will then be:
+
+|$\hat{y}_{i} = \hat{\mu}$|
+|:------------------------:|
+
+Where $\hat{\mu}$ is the estimate of the true testing time that minimises the loss function:
+
+|$RMSE = \sqrt{\frac{1}{N}\sum_{i=1}^{N}({y}_{i} - \hat{\mu})^2}$|
+|:--------------------------------------------------------------:|
+
+Where N is the total number of observations in the _train_ dataset. By mathematics, we know that the estimation that minimises the RMSE is the least squares estimation of $\mu$ which in this case is the average of all times in the _train_ dataset, which is $\hat{y}_{i} = \frac{1}{N}\sum_{i=1}^{N}y_{i}$ where $y_{i}$ are the true times in the _train_ dataset:
+
+```{r r2_2_5, echo = FALSE, results = 'asis', fig.align = 'center'}
+
+  mu_hat <- mean(train$y)
+  mu_hat 
+```
+
+If we compute the prediction with $\hat{\mu}$ in the *train* dataset the expected RMSE obtained is:
+
+```{r r2_2_6, echo = FALSE, results = 'asis'}
+
+  rmse <- RMSE(train$y, mu_hat)
+  rmse
+ 
+```
+
+Which is actually the standard deviation in the dataset.
+
+To confirm our assumption, we can see that we get higher *RMSE* when computing the prediction with any other number than $\hat{\mu}$ in the _train_ set:
+
+```{r r2_2_7, echo = FALSE, warning = FALSE}
+
+  n <- seq(50, 150, 5)
+  set.seed(1, sample.kind="Rounding")
+  mu_hat_1 <- sample(n, 5)
+  r <- data.frame(mu_hat_1, rmse = sapply(mu_hat_1, function(n) RMSE(train$y, n)))
+  r  %>% knitr::kable()  
+  
+```
+
+Finally, the *RMSE* value using $\hat{\mu}$ in the _test_ dataset is:
+
+```{r, echo = FALSE, results = 'asis'}
+
+  rmse <- RMSE(test$y, mu_hat)
+  rmse
+  
+  # create a table with the results
+  rmse_results <- tibble(method = "mu_hat",
+                       expectedRMSE = sd(train$y),
+                       RMSE = RMSE(test$y, mu_hat))
+ 
+```
+
+Which is actually not too far from the _expected RMSE_.
+
+\pagebreak
+
+### 2.7 Regression model {#a2_7}
+
+After the exploratory analysis and the conversion into binary of the categorical features, our model looks like:
+
+|$y_{i} = \mu + \sum_{j=1}^{F}e_{j}X_{j} + \epsilon_{i}$|
+|:-----------------------------------------------------:|
+
+Where $y_{i}$ is the total testing time for the car *i*, $\mu$ is the average testing time, *F* is the total number of features, $e_{j}$ is the variability of testing the feature *j*, $X_{j}$ is 1 when the feature *j* is present in the car and 0 otherwise and $\epsilon_{i}$ is and independent error.
+
+We call $\mu$ and $e_{j}$ the baseline predictors for which the algorithm has to compute estimates $\hat{\mu}$ and $\hat{e}_{j}$ that we will use to calculate predictions in the _test_ dataset as:
+
+|$\hat{y}_{i} = \hat{\mu} + \sum_{j=1}^{F}\hat{e}_{j}X_{j}$|
+|:--------------------------------------------------------:|
+
+By mathematics we know that we can use regression techniques to estimate the intecept $\mu$ and the coefficients $e_{j}$. Here we will apply two algorithms _Linear Regression_ and _Regression Trees_ with all the features available in the _train_ dataset.
+
+More information and the mathematical foundations of the algorithms can be found in the professor Irizarri's book sections [Linear Models](https://rafalab.github.io/dsbook/linear-models.html) and [Classification and Regression Trees](https://rafalab.github.io/dsbook/examples-of-algorithms.html#classification-and-regression-trees-cart).
+
+Below the outcome using regression with all the features:
+
+```{r, echo = FALSE, warning = FALSE}
+
+  fit_lm <- train(y ~ ., method = "lm", data = train)
+  pred_lm <- predict(fit_lm, test, method = "raw")
+  
+  expectedRMSE <- fit_lm$results$RMSE
+  RMSE = RMSE(test$y, pred_lm)
+  
+  rmse_results <- bind_rows(rmse_results, tibble(method = "linear regression",
+                                               expectedRMSE = expectedRMSE,
+                                               RMSE = RMSE))
+
+```
+
+```{r, echo = FALSE, warning = FALSE}
+
+  fit_rpart <- train(y ~ ., method = "rpart", data = train)
+  pred_rpart <- predict(fit_rpart, test, method = "raw")
+  
+  expectedRMSE <- min(fit_rpart$results$RMSE)
+  RMSE = RMSE(test$y, pred_rpart)
+  
+  rmse_results <- bind_rows(rmse_results, tibble(method = "regression trees",
+                                               expectedRMSE = expectedRMSE,
+                                               RMSE = RMSE))
+
+```
+
+```{r, echo = FALSE, results = "asis"}
+
+  rmse_results %>% knitr::kable()
+
+```
+
+The performance improves in both cases where linear regression offers better *RMSE* values in _train_ and _test_ meanwhile regression trees seems to be more stable with similar *RMSE* values in each dataset.
+
+\pagebreak
+
+### 2.8 Dimension reduction - Variable importance {#a2_8}
+
+There are three different ways to do dimensionality reduction. The first is just by feature selection that means looking through the available features and decide which ones are actually useful, i.e., correlated to the ouput variable.
+
+The second method is feature derivation, which means deriving new features from the old ones by applying transformations in the original dataset. Considering the features space as a n-dimensions matrix where n is the number of the available features, the transformations consist of changing the axes of coordinates by moving or rotating them and achieving the dimensionality reduction by combining the existing features in a smaller set of axes.
+
+The third is just using clustering to group similar datapoints and to see if this allows fewer features to be used.
+
+We start the exercise of reducing the number of features with the first method of feature selection, and for this we are leveraging the regression tree model built in the previous section using recurrent partitioning.
+
+The algorithm creates partitions in the features space recursively starting with one partition *R* with the whole features space, then split it into two partitions *R1* and *R2* that will then be split resulting in three partitions, then four, then five, etc. In order to create two new partitions, the algorithm finds a feature $X_{j}$ and a value *s* and split the observations in the current partition asking if the value of $X_{j}$ is *0* or *1*. 
+
+The criteria to pick $X_{j}$ and *s* are the pair that minimises the residual sum of squares in the new partitions: $\sum(y_{i} - \hat{y}_{R_{1}})^2 + \sum(y_{i} - \hat{y}_{R_{2}})^2$.
+
+To do the feature selection, we can look at the features that have been used at each partition step in the regression tree model and use only those to train new models:
+
+```{r, echo = FALSE, results = "asis"}
+
+  names(fit_rpart$finalModel$variable.importance) %>% knitr::kable()
+
+```
+
+```{r, echo = FALSE}
+
+  # Variable importance
+  imp <- names(fit_rpart$finalModel$variable.importance)
+  # transform train and validation. Reduce to the important variables
+  train_imp <- train %>% select(y, imp)
+  test_imp <- test %>% select(y, imp)
+
+```
+
+With the reduced set of dimensions we can afford more expensive algorithms like [k-Nearest Neighbors](https://rafalab.github.io/dsbook/cross-validation.html#knn-cv-intro). You can follow the link to find more information about *knn* in Professor Irizarri's book.
+
+```{r, echo = FALSE, warning = FALSE}
+  
+  # Linear regression
+  fit_lm_imp <- train(y ~ ., method = "lm", data = train_imp)
+  pred_lm_imp <- predict(fit_lm_imp, test_imp, method = "raw")
+ 
+  expectedRMSE <- fit_lm_imp$results$RMSE
+  RMSE = RMSE(test_imp$y, pred_lm_imp)
+  
+  rmse_results <- bind_rows(rmse_results, tibble(method = "variable importance - linear regression",
+                                               expectedRMSE = expectedRMSE,
+                                               RMSE = RMSE))
+  
+```
+
+
+```{r, echo = FALSE, warning = FALSE}
+  
+  # KNN
+  set.seed(1, sample.kind="Rounding")
+  fit_knn_imp <- train(y ~ ., method = "kknn", data = train_imp)
+  pred_knn_imp <- predict(fit_knn_imp, test_imp, method = "raw")
+ 
+  expectedRMSE <- min(fit_knn_imp$results$RMSE)
+  RMSE <- RMSE(test_imp$y, pred_knn_imp)
+  
+  rmse_results <- bind_rows(rmse_results, tibble(method = "variable importance - k-nearest neighbors",
+                                               expectedRMSE = expectedRMSE,
+                                               RMSE = RMSE))
+  
+```
+
+```{r, echo = FALSE, results = "asis"}
+
+  rmse_results %>% knitr::kable()
+
+```
+
+We can see a clear improvement using linear regression with the reduced set of features.
+
+\pagebreak
+
+### 2.9 Dimension reduction - Principal components analysis {#a2_9}
+
+PCA is the first of the two dimensionality reduction methods based in feature derivation we will use, that is computing transformation in the data to find a lower dimensional set of axes.
+
+A principal component is a direction of the data with the largest variation. The algorithm starts centering the data removing off the mean, then finds the direction in the data points with the largest variation and puts an axis in that direction. Then looks at the remaining variation and finds an orthogonal (perpendicular but in a n-dimension space) axis to the first one that conveys the largest remaining variation. The process repeats through all the possible axes. The final result is that the higher variation is in the first axes meanwhile the last ones have little variation and can be removed without significantly affecting the varability in the data.
+
+You can find the mathematics and more information in the section [Dimension reduction](https://rafalab.github.io/dsbook/large-datasets.html#dimension-reduction) of Professor Irizarri's book.
+
+```{r, echo = FALSE}
+
+  m <- train %>% select(-y)
+  m <- as.matrix(m)
+  pca <- prcomp(m)
+
+```
+
+The below chart shows the variation of the transformed axes in the _train_ dataset:
+
+```{r, echo = FALSE}
+
+  qplot(1:563, pca$sdev, xlab = "axis", ylab = "variation")
+  variance_explained <- summary(pca)$importance[3,] 
+  variance_explained <- variance_explained[variance_explained <= 0.99]
+  k <- which.max(variance_explained)
+ 
+```
+
+Only 216 dimensions hold the 99% of the variation. We can now train some models using only the 216 first dimensions out of the total 563.
+
+```{r, echo = FALSE, warning = FALSE}
+  
+  # transform train and validation to the new dimensions space
+  train_pca <- as_tibble(pca$x[, 1:k]) %>% mutate(y = train$y)
+
+  col_means <- colMeans(m)
+  test_pca <- test %>% select(-y)
+  test_pca <- as.matrix(test_pca)
+  test_pca <- sweep(test_pca, 2, col_means) %*% pca$rotation
+  test_pca <- as_tibble(test_pca[, 1:k]) %>% mutate(y = test$y)
+  
+```
+
+```{r, echo = FALSE, warning = FALSE}
+  
+  # Linear regression
+  fit_lm_pca <- train(y ~ ., method = "lm", data = train_pca)
+  pred_lm_pca <- predict(fit_lm_pca, test_pca, method = "raw")
+ 
+  expectedRMSE <- fit_lm_pca$results$RMSE
+  RMSE = RMSE(test_pca$y, pred_lm_pca)
+  
+  rmse_results <- bind_rows(rmse_results, tibble(method = "PCA - linear regression",
+                                               expectedRMSE = expectedRMSE,
+                                               RMSE = RMSE))
+  
+```
+
+\pagebreak
+
+The table below shows the results of training two models, Linear regression and KNN with the reduced features space:
+
+```{r, echo = FALSE, warning = FALSE}
+  
+  # KNN
+  set.seed(1, sample.kind="Rounding")
+  fit_knn_pca <- train(y ~ ., method = "kknn", data = train_pca)
+  pred_knn_pca <- predict(fit_knn_pca, test_pca, method = "raw")
+ 
+  expectedRMSE <- min(fit_knn_pca$results$RMSE)
+  RMSE <- RMSE(test_pca$y, pred_knn_pca)
+  
+  rmse_results <- bind_rows(rmse_results, tibble(method = "PCA - k-nearest neighbors",
+                                               expectedRMSE = expectedRMSE,
+                                               RMSE = RMSE))
+  
+```
+
+```{r, echo = FALSE}
+
+  rmse_results %>% knitr::kable()
+
+```
+
+We get an improvement using linear regression with the PCA reduced features space meanwhile KNN is still under performing.
+
+\pagebreak
+
+### 2.10 Dimension reduction - Independent Component Analysis {#a2_10}
+
+While PCA is about correlation by maximising the variance, our last method of dimension reduction is focused on independence. ICA tries to transform our original set of features $X_{1}, X_{2}, ... , X_{n}$ into a new set of features $I_{1}, I_{2}, ... , I_{n}$ that are mutually independent in the statistical sense while the correlation between each of the new features and the original ones is as high as possible.
+
+Though ICA was initially developed to separate a multivariate signal into additive subcomponents or blind source separation also known as the cocktail party problem, it has another useful application on feature extraction. The idea is to use linear transformations to find suitable but smaller representations from the data, which is what we want to achieve with dimension reduction.
+
+You can find the mathematics and more information about ICA in the book [Machine Learning (An Algorithmic Perspective)](https://seat.massey.ac.nz/personal/s.r.marsland/MLBook.html) by Stephen Marsland.
+
+To perform the Independent component analysis we have to provide the number of components in the final predictors space (number of sources in the original notation) to the algorithm. As we do not know which number will be the optimal, we will try to work it out iterating the algorithm and picking up the number of components that gives the best RMSE in the _carTesting_ dataset.
+
+The chart below shows the results:
+
+```{r, echo = FALSE, warning = FALSE}
+
+  # Independent components analysis
+  
+  m <- carTesting %>% select(-y)
+  
+  sources <- 5:40
+  
+  # find optimal number of sources
+  rmses <- sapply(sources, function(s) {
+    ica <- fastICA(m, s)
+    
+    # transform train to the ICA space
+    train_ica <- as_tibble(ica$S) %>% mutate(y = carTesting$y)
+    
+    fit_lm_ica <- train(y ~ ., method = "lm", data = train_ica)
+    rmse <- fit_lm_ica$results$RMSE
+    return(rmse)
+  })
+
+  qplot(sources, rmses, xlab = "# dimensions", ylab = "RMSE in the carTesting dataset")
+  
+```
+
+And the best number of components is:
+
+```{r, echo = FALSE, results = "asis"}
+
+  sources[which.min(rmses)]
+
+```
+
+\pagebreak
+
+We can now compute the reduced ICA predictors space and train some models:
+
+```{r, echo = FALSE}
+
+  best_source <- sources[which.min(rmses)]
+
+  # calculate predictors with the best source number
+   m <- train %>% select(-y)
+  ica <- fastICA(m, best_source)
+  
+  # transform train and validation
+  train_ica <- as_tibble(ica$S) %>% mutate(y = train$y)
+  X <- test %>% select(-y) %>% as.matrix()
+  S_hat <- X %*% ica$K %*% ica$W
+  test_ica <- as_tibble(S_hat) %>% mutate(y = test$y)
+  
+```
+
+```{r, echo = FALSE, warning = FALSE}
+  
+  # Linear regression
+  fit_lm_ica <- train(y ~ ., method = "lm", data = train_ica)
+  pred_lm_ica <- predict(fit_lm_ica, test_ica, method = "raw")
+ 
+  expectedRMSE <- fit_lm_ica$results$RMSE
+  RMSE = RMSE(test_ica$y, pred_lm_ica)
+  
+  rmse_results <- bind_rows(rmse_results, tibble(method = "ICA - linear regression",
+                                               expectedRMSE = expectedRMSE,
+                                               RMSE = RMSE))
+  
+```
+
+```{r, echo = FALSE, warning = FALSE}
+  
+  # KNN
+  set.seed(1, sample.kind="Rounding")
+  fit_knn_ica <- train(y ~ ., method = "kknn", data = train_ica)
+  pred_knn_ica <- predict(fit_knn_ica, test_ica, method = "raw")
+ 
+  expectedRMSE <- min(fit_knn_ica$results$RMSE)
+  RMSE <- RMSE(test_ica$y, pred_knn_ica)
+  
+  rmse_results <- bind_rows(rmse_results, tibble(method = "ICA - k-nearest neighbors",
+                                               expectedRMSE = expectedRMSE,
+                                               RMSE = RMSE))
+  
+```
+
+```{r, echo = FALSE, results = "asis"}
+
+  rmse_results %>% knitr::kable()
+
+```
+
+Linear regression using the ICA features does not give any improvement in the _test_ dataset though is the second best performer in the _train_ dataset meanwhile KNN is again the worst performer in both datasets.
+
+\pagebreak
+
+### 2.11 Summary of the analysis {#a2_11}
+
+From the previous analysis we can see that regression are the best performing methods in all the cases and that we can also achieve improvements by dimension reduction.
+
+```{r, echo = FALSE, results = "asis"}
+
+  rmse_results[c(2, 3, 4, 6, 8),] %>% 
+    knitr::kable()
+
+```
+
+It seems safe to discard the kernel algorithm in the final model and stick to regression using one of the features reduction methods, variable importance, principal component analysis or independent component analysis. PCA is the one who performs better in the _test_ set but not in the _train_ set, besides variable importance seems more coherent as it 'learns' better the _train_ set including some of the noise and therefore gets slightly worse results in the _test_ set. In summary also all these results can be just due to luck, the way both datasets are built.
+
+Our decision is to use a blend of the three methods in the final model and compute the predictions as the average of the predictions obtained with the three of them.
+
+\pagebreak
+
+## III. Results {#results}
+
+In the final model we will put together an ensemble of regression algorithms and the three feature reduction methods explained in the previous chapter:
+
+|Dimension reduction|Algorithm|
+|:------------------|:--------|
+|Principal Component Analysis|Linear regression|
+|Independent Component Analysis|Linear regression|
+|Independent Component Analysis|Random forests|
+|Variable Importance|Linear regresssion|
+|Variable Importance|Random forests|
+
+Here we have included the Random forest algorithm for ICA and variable importance due to the resulting low number of features in both methods. You can find more information about the algorithm in the section [Random forests](https://rafalab.github.io/dsbook/examples-of-algorithms.html#random-forests) of Professor Irisarri's book.
+
+We will train five models with the _carTesting_ set and make a final prediction in the _validation_ set using a weighted average of the predictions of the five models. So our prediction for the testing time of a car *i* is:
+
+|$\hat{y}_{i} = \sum_{m=1}^{5}w_{m}\hat{y}_{im} / \sum_{m=1}^{5}w_{m}$|
+|:-------------------------------------------------------------------:|
+
+Where $w_{m}$ is the weight of the model *m* in the final prediction and $\hat{y}_{im}$ is the prediction of the model *m* for the car *i*.
+
+We assume that some models are better learners than others and therefore we want to assing different weights to each one in the final prediction. In the following section we explain the steps performed to calculate these weights using cross-validation techniques.
+
+\pagebreak
+
+### 3.1 Cross-validation {#a3_1}
+
+We have to estimate the weights to be assigned to each of the algorithms and to do that we want to compare the outcome of the predictions with different weights combinations. We cannot do that just training the algorithms and testing the predictions in the _carTesting_ at the risk of overtraining our model. Therefore our first step is to split _carTesting_ in two new random training and testing sets, _train\_cv_ and _test\_cv_ with a 80% and 20% of the data respectively.
+
+Next, we will train the five models with the _tran\_cv_ dataset and run predictions in _test\_cv_ with different weights combinations to find the best perfomer. To save time, we will test the weights of one model at a time and use the weights obtained in the previous steps to test the next model.
+
+The below table shows the best performers after running predictions on _test\_cv_ using weights from 1 to 50 for each model:
+
+|Algorithm     | Weight| Expected RMSE|
+|:-------------|-----:|--------------:|
+|PCA-Linear regression|    9|        7.8839|
+|VarImp-Linear regresssion |     5|        7.8517|
+|ICA-Linear regresssion    |     1|        7.8517|
+|VarImp-Random forests     |     2|        7.8510|
+|ICA-Random forests|     1|        7.8510|
+
+### 3.2 Prediction in the validation dataset {#a3_2}
+
+To finalise, we train a model in the _train\_cv_ set and build a prediction in the _validation_ set using the weights obtained in the previos section. Below the final *RMSE* value:
+
+|*RMSE*|*7.911*|
+|:----:|:------:|
+
+\pagebreak
+
+## IV. Conclusions {#conclusions}
+
+The performance obtained $7.911$ is below the standard deviation of the _validation_ dataset $12.448$ by just a 37% which is not a spectacular result. Using or including in the blend better learners like Neural Networks algorithms could lead to further improvement but would increase the risk of overtraining so more attention should be put on this point. 
+
+The limitations of the dataset related to the low number of observations have to be also mentioned. Increasing the observations and adding more information like the dates of the tests, the team or machines involved or other details of the proccess, will undoubtely help to train more accurate models.
+
+\begin{flushright}
+Murcia, $3^{rd}$ January 2020
+\end{flushright} 
