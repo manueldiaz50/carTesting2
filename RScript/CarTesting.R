@@ -15,7 +15,7 @@ if(!require(randomForest)) install.packages("randomForest", repos = "http://cran
 
 # load data
 dl <- tempfile()
-download.file("https://raw.githubusercontent.com/manueldiaz50/CarTesting/master/Data/train.csv", dl)
+download.file("https://raw.githubusercontent.com/manueldiaz50/carTesting2/master/Data/train.csv", dl)
 data <- read.csv(dl, header = TRUE)
 
 # convert categorical variables to binary
